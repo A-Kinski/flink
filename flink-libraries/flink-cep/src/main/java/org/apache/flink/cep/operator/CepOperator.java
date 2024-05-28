@@ -31,6 +31,7 @@ import org.apache.flink.api.common.typeutils.base.LongSerializer;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.cep.EventComparator;
 import org.apache.flink.cep.configuration.SharedBufferCacheConfig;
+import org.apache.flink.cep.functions.UnmatchedEventsHandler;
 import org.apache.flink.cep.functions.PatternProcessFunction;
 import org.apache.flink.cep.functions.TimedOutPartialMatchHandler;
 import org.apache.flink.cep.nfa.NFA;
@@ -95,12 +96,14 @@ public class CepOperator<IN, KEY, OUT>
 
     private static final String NFA_STATE_NAME = "nfaStateName";
     private static final String EVENT_QUEUE_STATE_NAME = "eventQueuesStateName";
+    private static final String UNMATCHED_EVENTS_STATE_NAME ="unmatchedEventsStateName";
 
     private final NFACompiler.NFAFactory<IN> nfaFactory;
 
     private transient ValueState<NFAState> computationStates;
     private transient MapState<Long, List<IN>> elementQueueState;
     private transient SharedBuffer<IN> partialMatches;
+    private transient ValueState<List<IN>> unmatchedEvents;
 
     private transient InternalTimerService<VoidNamespace> timerService;
 
@@ -195,6 +198,13 @@ public class CepOperator<IN, KEY, OUT>
                                         LongSerializer.INSTANCE,
                                         new ListSerializer<>(inputSerializer)));
 
+        unmatchedEvents = context.getKeyedStateStore()
+                .getState(
+                        new ValueStateDescriptor<>(
+                                UNMATCHED_EVENTS_STATE_NAME,
+                                new ListSerializer<>(inputSerializer)
+                        ));
+
         if (context.isRestored()) {
             partialMatches.migrateOldState(getKeyedStateBackend(), computationStates);
         }
@@ -286,6 +296,10 @@ public class CepOperator<IN, KEY, OUT>
 
         elementsForTimestamp.add(event);
         elementQueueState.put(currentTime, elementsForTimestamp);
+        if (unmatchedEvents.value() == null) {
+            unmatchedEvents.update(new ArrayList<>());
+        }
+        unmatchedEvents.value().add(event);
     }
 
     @Override
@@ -330,6 +344,7 @@ public class CepOperator<IN, KEY, OUT>
         // In order to remove dangling partial matches.
         if (nfaState.getPartialMatches().size() == 1 && nfaState.getCompletedMatches().isEmpty()) {
             computationStates.clear();
+            processUnmatchedEvents();
         }
     }
 
@@ -417,6 +432,9 @@ public class CepOperator<IN, KEY, OUT>
                 registerTimer(timestamp + nfa.getWindowTime());
             }
             processMatchedSequences(patterns, timestamp);
+            if (!patterns.isEmpty()) {
+                    processUnmatchedEvents();
+            }
         }
     }
 
@@ -446,6 +464,11 @@ public class CepOperator<IN, KEY, OUT>
             if (!timedOut.isEmpty()) {
                 processTimedOutSequences(timedOut);
             }
+
+            if (!pendingMatches.isEmpty() && !timedOut.isEmpty()) {
+                processUnmatchedEvents();
+            }
+
         }
     }
 
@@ -455,6 +478,9 @@ public class CepOperator<IN, KEY, OUT>
         setTimestamp(timestamp);
         for (Map<String, List<IN>> matchingSequence : matchingSequences) {
             function.processMatch(matchingSequence, context, collector);
+            for (List<IN> matchEvents: matchingSequence.values()) {
+                    removeMatchEventFromUnmatchedEvents(matchEvents);
+            }
         }
     }
 
@@ -470,7 +496,32 @@ public class CepOperator<IN, KEY, OUT>
             for (Tuple2<Map<String, List<IN>>, Long> matchingSequence : timedOutSequences) {
                 setTimestamp(matchingSequence.f1);
                 timeoutHandler.processTimedOutMatch(matchingSequence.f0, context);
+
+                for (List<IN> matchEvents: matchingSequence.f0.values()) {
+                        removeMatchEventFromUnmatchedEvents(matchEvents);
+                }
             }
+        }
+    }
+
+    private void processUnmatchedEvents() throws Exception {
+        PatternProcessFunction<IN, OUT> function = getUserFunction();
+        if (function instanceof UnmatchedEventsHandler
+                && unmatchedEvents.value() != null
+                && !unmatchedEvents.value().isEmpty()) {
+            UnmatchedEventsHandler<IN> unmatchedEventsHandler = (UnmatchedEventsHandler<IN>) function;
+            unmatchedEventsHandler.processUnmatchedEvents(unmatchedEvents.value(), context);
+            unmatchedEvents.clear();
+        }
+
+        if (unmatchedEvents.value() != null && unmatchedEvents.value().isEmpty()) {
+            unmatchedEvents.clear();
+        }
+    }
+
+    private void removeMatchEventFromUnmatchedEvents(List<IN> matchEvents) throws IOException {
+        if (unmatchedEvents.value() != null && !unmatchedEvents.value().isEmpty()) {
+            unmatchedEvents.value().removeAll(matchEvents);
         }
     }
 
